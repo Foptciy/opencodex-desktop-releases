@@ -1,0 +1,81 @@
+name: Remaining Windows gate diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Frozen private source SHA to diagnose
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    if: github.actor == github.repository_owner
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate frozen source
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+        run: |
+          if ($env:SOURCE_COMMIT -cnotmatch '^[a-f0-9]{40}$') { throw 'Expected full source SHA' }
+          $currentSource = gh api repos/Foptciy/opencodex-desktop/commits/main --jq .sha
+          if ($LASTEXITCODE -ne 0 -or $currentSource.Trim() -ne $env:SOURCE_COMMIT) { throw 'Source main differs' }
+      - uses: actions/checkout@v4
+        with:
+          repository: Foptciy/opencodex-desktop
+          ref: ${{ inputs.source_commit }}
+          token: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install exact diagnostic dependencies
+        shell: pwsh
+        run: |
+          npm ci --no-audit --no-fund *> (Join-Path $env:RUNNER_TEMP 'diagnostic-install.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic dependency installation failed' }
+          node scripts/configure-native-test-path.mjs
+      - name: Diagnose every gate after Workplace without building release packages
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+        run: |
+          $diagnosticLog = Join-Path $env:RUNNER_TEMP 'windows-diagnostics.log'
+          @'
+          import { readFileSync, writeFileSync, mkdirSync, openSync, closeSync, existsSync } from 'node:fs';
+          import { createRequire } from 'node:module';
+          import { resolve, join } from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          import { nativeReleaseGates } from './scripts/native-release-workaround.mjs';
+          const require = createRequire(resolve('package.json'));
+          const all = nativeReleaseGates(require('js-yaml').load(readFileSync('.github/workflows/build.yml', 'utf8')), 'windows');
+          const index = all.findIndex(g => g.name === 'Verify Virtual Workplace and opt-in chat collaboration');
+          if (index < 0) throw new Error('Missing Workplace boundary');
+          const directory = join(process.env.RUNNER_TEMP, 'windows-remaining-gates'); mkdirSync(directory);
+          const report = { diagnosticsOnly: true, packagesBuilt: false, sourceCommit: process.env.SOURCE_COMMIT, gates: [] };
+          for (const [i, gate] of all.slice(index + 1).entries()) {
+            const path = join(directory, `gate-${i + 1}.json`), log = join(directory, `gate-${i + 1}.log`);
+            const args = gate.command.match(/"[^"]*"|'[^']*'|\S+/g).map(t => /^["']/.test(t) ? t.slice(1, -1) : t);
+            const fd = openSync(log, 'w');
+            const result = spawnSync(process.execPath, [require.resolve('vitest/vitest.mjs'), ...args.slice(2), '--reporter=json', `--outputFile=${path}`], { stdio: ['ignore', fd, fd] }); closeSync(fd);
+            const tests = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
+            report.gates.push({ ...gate, exitCode: result.status, passed: result.status === 0 && tests?.success === true, passedTests: tests?.numPassedTests, failedTests: tests?.numFailedTests });
+          }
+          writeFileSync(join(directory, 'windows-diagnostics.json'), JSON.stringify(report, null, 2));
+          process.exitCode = report.gates.every(g => g.passed) ? 0 : 1;
+          '@ | node --input-type=module *> $diagnosticLog
+          $diagnosticExit = $LASTEXITCODE
+          $releaseVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $draftTag = 'packages-v' + $releaseVersion + '-' + $env:SOURCE_COMMIT.Substring(0, 12)
+          $archive = Join-Path $env:RUNNER_TEMP 'windows-remaining-gates.zip'
+          Compress-Archive -Path (Join-Path $env:RUNNER_TEMP 'windows-remaining-gates/*') -DestinationPath $archive
+          gh release upload $draftTag --repo Foptciy/opencodex-desktop $archive $diagnosticLog --clobber
+          if ($LASTEXITCODE -ne 0 -or $diagnosticExit -ne 0) { throw 'Diagnostics found a failure; inspect the private archive' }
+          Write-Output 'Remaining diagnostic gates passed. Full native build validation is still required for publication.'
