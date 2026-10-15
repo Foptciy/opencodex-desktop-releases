@@ -69,6 +69,7 @@ jobs:
             report.gates.push({ ...gate, exitCode: result.status, passed: result.status === 0 && tests?.success === true, passedTests: tests?.numPassedTests, failedTests: tests?.numFailedTests });
           }
           writeFileSync(join(directory, 'windows-diagnostics.json'), JSON.stringify(report, null, 2));
+          console.log(`Completed ${report.gates.length} diagnostic gates; failed: ${report.gates.filter(g => !g.passed).length}`);
           process.exitCode = report.gates.every(g => g.passed) ? 0 : 1;
           '@ | node --input-type=module *> $diagnosticLog
           $diagnosticExit = $LASTEXITCODE
