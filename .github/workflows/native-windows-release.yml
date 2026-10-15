@@ -1,0 +1,71 @@
+name: Native Windows release fallback
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact frozen source SHA on private main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-windows-release-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Verify and collect native Windows packages
+    if: github.actor == github.repository_owner
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate the frozen source request
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+        run: |
+          if ($env:SOURCE_COMMIT -cnotmatch '^[a-f0-9]{40}$') { throw 'Expected the full frozen source SHA' }
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Expected native Windows x64' }
+          $currentSource = gh api repos/Foptciy/opencodex-desktop/commits/main --jq .sha
+          if ($LASTEXITCODE -ne 0 -or $currentSource.Trim() -ne $env:SOURCE_COMMIT) { throw 'Source main differs from the requested release' }
+
+      - name: Check out the exact private source
+        uses: actions/checkout@v4
+        with:
+          repository: Foptciy/opencodex-desktop
+          ref: ${{ inputs.source_commit }}
+          token: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up native Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run all native gates, package, verify, and collect privately
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+        run: |
+          $releaseVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $releaseDraftTag = 'packages-v' + $releaseVersion + '-' + $env:SOURCE_COMMIT.Substring(0, 12)
+          $releaseBuildLog = Join-Path $env:RUNNER_TEMP 'windows-native-build.log'
+          $releaseReportDir = Join-Path $env:RUNNER_TEMP 'windows-native-validation'
+          # Keep private source/compiler/test output in the private collection.
+          node scripts/native-release-workaround.mjs build $releaseReportDir *> $releaseBuildLog
+          $releaseBuildExit = $LASTEXITCODE
+          gh release upload $releaseDraftTag --repo Foptciy/opencodex-desktop $releaseBuildLog --clobber
+          if (Test-Path $releaseReportDir) {
+            $releaseValidationArchive = Join-Path $env:RUNNER_TEMP 'windows-native-validation.zip'
+            Compress-Archive -Path (Join-Path $releaseReportDir '*') -DestinationPath $releaseValidationArchive -Force
+            gh release upload $releaseDraftTag --repo Foptciy/opencodex-desktop $releaseValidationArchive --clobber
+          }
+          if ($releaseBuildExit -ne 0) { throw 'Native Windows build/gates failed; inspect the private build log and validation archive' }
+          $releaseReport = Get-Content (Join-Path $releaseReportDir 'windows-release-validation.json') -Raw | ConvertFrom-Json
+          if (-not $releaseReport.success) { throw 'Native Windows validation did not complete' }
+          Write-Output ('Verified Windows {0} from {1}; {2} native release gates passed.' -f $releaseVersion, $env:SOURCE_COMMIT, $releaseReport.gates.Count)
