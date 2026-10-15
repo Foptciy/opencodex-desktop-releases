@@ -1,0 +1,21 @@
+name: Native release runner availability
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Check standard Windows runner
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify native Windows x64 availability
+        shell: pwsh
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Expected native Windows x64' }
+          Write-Output 'Native Windows x64 runner is available.'
+          node --version
+          gh --version
