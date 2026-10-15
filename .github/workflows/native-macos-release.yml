@@ -1,0 +1,72 @@
+name: Native macOS release fallback
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact frozen source SHA on private main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-macos-release-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: Verify and collect native macOS packages
+    if: github.actor == github.repository_owner
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate the frozen source request
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]] || { echo 'Expected the full frozen source SHA'; exit 1; }
+          [[ "$(uname -m)" == arm64 ]] || { echo 'Expected native macOS ARM64'; exit 1; }
+          currentSource=$(gh api repos/Foptciy/opencodex-desktop/commits/main --jq .sha)
+          [[ "$currentSource" == "$SOURCE_COMMIT" ]] || { echo 'Source main differs from the requested release'; exit 1; }
+
+      - name: Check out the exact private source
+        uses: actions/checkout@v4
+        with:
+          repository: Foptciy/opencodex-desktop
+          ref: ${{ inputs.source_commit }}
+          token: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up native Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run all native gates, package, verify, and collect privately
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+        run: |
+          releaseVersion=$(node -p 'require("./package.json").version')
+          releaseDraftTag="packages-v${releaseVersion}-${SOURCE_COMMIT:0:12}"
+          releaseBuildLog="$RUNNER_TEMP/macos-native-build.log"
+          releaseReportDir="$RUNNER_TEMP/macos-native-validation"
+          releaseBuildExit=0
+          # Keep private source/compiler/test output in the private collection.
+          node scripts/native-release-workaround.mjs build "$releaseReportDir" > "$releaseBuildLog" 2>&1 || releaseBuildExit=$?
+          gh release upload "$releaseDraftTag" --repo Foptciy/opencodex-desktop "$releaseBuildLog" --clobber
+          if [[ -d "$releaseReportDir" ]]; then
+            releaseValidationArchive="$RUNNER_TEMP/macos-native-validation.tar.gz"
+            tar -czf "$releaseValidationArchive" -C "$releaseReportDir" .
+            gh release upload "$releaseDraftTag" --repo Foptciy/opencodex-desktop "$releaseValidationArchive" --clobber
+          fi
+          if [[ "$releaseBuildExit" -ne 0 ]]; then
+            echo 'Native macOS build/gates failed; inspect the private build log and validation archive'
+            exit "$releaseBuildExit"
+          fi
+          node -e 'const fs = require("node:fs"); const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); if (!r.success || r.platform !== "macos" || r.architecture !== "arm64") throw new Error("Native macOS validation did not complete"); console.log(`Verified macOS ${r.version} from ${r.sourceCommit}; ${r.gates.length} native release gates passed.`)' "$releaseReportDir/macos-release-validation.json"
