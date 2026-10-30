@@ -1,0 +1,81 @@
+name: Publish verified native release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact frozen source SHA on private main with both native reports
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-native-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish synchronized packages
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      GH_TOKEN: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+    steps:
+      - name: Validate frozen private source
+        shell: bash
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]] || { echo 'Expected a full source SHA'; exit 1; }
+          currentSource=$(gh api repos/Foptciy/opencodex-desktop/commits/main --jq .sha)
+          [[ "$currentSource" == "$SOURCE_COMMIT" ]] || { echo 'Private main differs from the requested release'; exit 1; }
+
+      - name: Check out release verification tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+          persist-credentials: false
+
+      - name: Check out exact private publisher
+        uses: actions/checkout@v4
+        with:
+          repository: Foptciy/opencodex-desktop
+          ref: ${{ inputs.source_commit }}
+          token: ${{ secrets.NATIVE_RELEASE_SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify native reports, publish, and verify all public assets
+        working-directory: source
+        shell: bash
+        run: |
+          releaseVersion=$(node -p 'require("./package.json").version')
+          releaseDraftTag="packages-v${releaseVersion}-${SOURCE_COMMIT:0:12}"
+          releaseLog="$RUNNER_TEMP/synchronized-publication.log"
+          verificationReport="$RUNNER_TEMP/public-release-verification.json"
+          releaseExit=0
+          # Private dependency and publisher diagnostics stay in the source draft.
+          npm ci --ignore-scripts --no-audit --no-fund > "$releaseLog" 2>&1 || releaseExit=$?
+          if [[ "$releaseExit" -eq 0 ]]; then
+            node scripts/native-release-workaround.mjs publish >> "$releaseLog" 2>&1 || releaseExit=$?
+          fi
+          if [[ "$releaseExit" -eq 0 ]]; then
+            node ../release-tools/scripts/verify-public-release.mjs "$PWD" "$releaseVersion" "$SOURCE_COMMIT" "$verificationReport" >> "$releaseLog" 2>&1 || releaseExit=$?
+          fi
+          gh release upload "$releaseDraftTag" --repo Foptciy/opencodex-desktop "$releaseLog" --clobber
+          if [[ -f "$verificationReport" ]]; then
+            gh release upload "$releaseDraftTag" --repo Foptciy/opencodex-desktop "$verificationReport" --clobber
+          fi
+          if [[ "$releaseExit" -ne 0 ]]; then
+            echo 'Synchronized publication or public verification failed; inspect private diagnostics.'
+            exit "$releaseExit"
+          fi
+          echo "Verified all public assets and both latest feeds for $releaseVersion from $SOURCE_COMMIT."
